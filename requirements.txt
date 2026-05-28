@@ -1,0 +1,9 @@
+flask>=2.3.0
+numpy>=1.24.0
+# Production additions (uncomment when deploying on hardware):
+# opencv-python-headless>=4.7.0   # AR glasses video processing
+# scikit-learn>=1.3.0             # Human state ML models
+# qdrant-client>=1.7.0            # Autobiographical vector DB
+# openai>=1.10.0                  # LLM embedding + regulatory engine
+# torch>=2.1.0                    # YOLOv9, Depth Anything v2
+# langchain>=0.1.0                # LangGraph orchestration
