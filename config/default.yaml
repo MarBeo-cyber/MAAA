@@ -1,0 +1,18 @@
+maaa:
+  max_words: 9
+  latency:
+    tier0_guidance_ms: 50
+    tier1_cognitive_loop_ms: 200
+    tier2_memory_ms: 1000
+  safety:
+    offline_first: true
+    human_override: true
+    raw_video_cloud_upload: false
+  risk_thresholds:
+    medium: 0.35
+    high: 0.65
+    critical: 0.85
+  resource_governor:
+    llm_in_primary_emergency_loop: false
+    local_models_only_default: true
+    max_context_tokens_daily: 2048
