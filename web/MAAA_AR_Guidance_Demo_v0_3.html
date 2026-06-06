@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="it"><head><meta charset="UTF-8"><title>MAAA v0.3 AR Guidance Demo</title>
+<style>
+body{margin:0;background:#050813;color:#f6f8ff;font-family:system-ui,Segoe UI,sans-serif;display:flex;flex-direction:column;align-items:center;padding:24px}
+h1{font-size:13px;letter-spacing:.22em;color:rgba(255,255,255,.42);text-transform:uppercase}
+.frame{width:860px;height:470px;border:1px solid rgba(74,184,255,.25);border-radius:22px;position:relative;overflow:hidden;background:linear-gradient(180deg,#121a32,#060914);box-shadow:0 30px 80px rgba(0,0,0,.45)}
+.grid{position:absolute;inset:0;background-image:linear-gradient(rgba(255,255,255,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.05) 1px,transparent 1px);background-size:46px 46px}
+.danger{position:absolute;left:0;top:0;bottom:0;width:42%;background:repeating-linear-gradient(45deg,rgba(255,80,70,.14) 0 10px,transparent 10px 20px);opacity:0;transition:.4s;border-right:3px solid rgba(255,80,70,.55)}
+.danger.on{opacity:1}
+.path{position:absolute;right:105px;bottom:130px;display:flex;align-items:center;opacity:0;transition:.4s}
+.path.on{opacity:1}
+.body{width:160px;height:12px;background:linear-gradient(90deg,rgba(24,212,155,.25),#18d49b);border-radius:999px;box-shadow:0 0 20px rgba(24,212,155,.55)}
+.head{width:0;height:0;border-top:28px solid transparent;border-bottom:28px solid transparent;border-left:46px solid #18d49b;filter:drop-shadow(0 0 12px rgba(24,212,155,.7))}
+.stop{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;opacity:0;transition:.2s}
+.stop.on{opacity:1}.ring{width:150px;height:150px;border-radius:50%;border:5px solid #ff5a4f;display:flex;align-items:center;justify-content:center;color:#ff5a4f;font-size:34px;font-weight:900;letter-spacing:.1em;box-shadow:0 0 35px rgba(255,90,79,.5)}
+.voice{position:absolute;left:50%;bottom:38px;transform:translateX(-50%);background:rgba(0,0,0,.68);border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px 18px;font-weight:800;opacity:0;transition:.3s}
+.voice.on{opacity:1}.hud{position:absolute;top:18px;left:18px;right:18px;display:flex;justify-content:space-between;color:rgba(255,255,255,.52);font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+.panel{width:860px;margin-top:18px;border:1px solid rgba(255,255,255,.08);border-radius:14px;background:rgba(255,255,255,.035);padding:14px;font-size:13px;color:rgba(255,255,255,.70)}
+button{margin:14px 6px 0;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:10px 16px;background:rgba(255,255,255,.05);color:#f6f8ff;font-weight:800;cursor:pointer}
+button:hover{background:rgba(255,255,255,.10)}
+</style></head><body>
+<h1>MAAA v0.3 — Shared Embodiment AR Guidance</h1>
+<div class="frame">
+  <div class="grid"></div><div class="danger" id="danger"></div>
+  <div class="hud"><span>L1-L5 ACTIVE</span><span id="state">IDLE</span></div>
+  <div class="stop" id="stop"><div class="ring">STOP</div></div>
+  <div class="path" id="path"><div class="body"></div><div class="head"></div></div>
+  <div class="voice" id="voice">Monitoraggio attivo.</div>
+</div>
+<div>
+<button onclick="run()">Scenario terremoto</button><button onclick="reset()">Reset</button>
+</div>
+<div class="panel" id="panel">Pipeline: L1 percezione incarnata → L2 scena/rischio → L3 stato umano → L4 regolazione → L5 continuità.</div>
+<script>
+let timers=[];
+function later(f,t){timers.push(setTimeout(f,t))}
+function reset(){timers.forEach(clearTimeout);timers=[];['danger','stop','path','voice'].forEach(id=>document.getElementById(id).classList.remove('on'));document.getElementById('state').textContent='IDLE';document.getElementById('voice').textContent='Monitoraggio attivo.';document.getElementById('panel').textContent='Pipeline: L1 percezione incarnata → L2 scena/rischio → L3 stato umano → L4 regolazione → L5 continuità.'}
+function run(){reset();document.getElementById('state').textContent='RISK SCAN';document.getElementById('panel').textContent='L2 Risk Engine: area sinistra 0.93 CRITICO, uscita destra 0.10 BASSO.';later(()=>{document.getElementById('danger').classList.add('on');document.getElementById('voice').classList.add('on');document.getElementById('voice').textContent='Pericolo a sinistra.'},800);later(()=>{document.getElementById('state').textContent='TIER-0 GUIDANCE';document.getElementById('stop').classList.add('on');document.getElementById('voice').textContent='STOP. Non andare a sinistra.'},1900);later(()=>{document.getElementById('stop').classList.remove('on');document.getElementById('path').classList.add('on');document.getElementById('voice').textContent='DESTRA. USCITA. ORA.';document.getElementById('panel').textContent='L4 Regulatory Engine: output ridotto, imperativo, multimodale. L5 registra evento e verifica continuità.'},3100)}
+</script></body></html>
