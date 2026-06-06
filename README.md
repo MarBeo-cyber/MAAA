@@ -1,3 +1,5 @@
+[![AURA Framework](https://img.shields.io/badge/AURA-Level%202%20%7C%20MAAA-1F3864)](https://github.com/MarBeo-cyber/AURA)
+
 # MAAA — Metacognitive Autopoietic Adaptive Agent
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)](https://python.org)
