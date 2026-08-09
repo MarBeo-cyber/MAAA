@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+from typing import Optional
+
+import maaa_config
 from .models import SceneGraph, HumanState, GuidancePlan, GuidanceMode, OutputChannel, RiskLevel
 from .risk import RiskEstimationEngine
+
+#: Human override commands accepted in SensorFrame.user_command (NFR-05).
+#:   mute   — latch guidance off; CRITICAL priority still gets through
+#:   resume — clear the latch
+#:   stop   — one-shot: this frame produces no guidance at all
+USER_COMMANDS = ("mute", "resume", "stop")
 
 
 class RegulatoryEngine:
@@ -11,8 +20,8 @@ class RegulatoryEngine:
     relevance, timing, brevity and urgency.
     """
 
-    def __init__(self, max_words: int = 9) -> None:
-        self.max_words = max_words
+    def __init__(self, max_words: Optional[int] = None) -> None:
+        self.max_words = max_words if max_words is not None else maaa_config.max_words()
         self.risk_engine = RiskEstimationEngine()
 
     def plan(self, graph: SceneGraph, human: HumanState) -> GuidancePlan:

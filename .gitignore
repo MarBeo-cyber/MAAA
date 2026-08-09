@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+.venv/
+venv/
+env/
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime artefacts of the L5 memory layer
+*.db
+maaa_autobio*.json
+*.corrupt-*
+
+.DS_Store
+.idea/
+.vscode/

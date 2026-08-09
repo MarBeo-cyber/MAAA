@@ -1,6 +1,8 @@
 """
 MAAA — Main Entry Point
-Metacognitive Autopoietic Adaptive Agent v1.0
+Metacognitive Autopoietic Adaptive Agent (version: maaa_config.VERSION)
+
+All sensor input is synthetic. See README.md.
 
 Run modes:
   python main_maaa.py demo      — four-phase earthquake scenario demo
@@ -15,10 +17,14 @@ Demo phases:
   Phase 4 (NORMAL, 10s):    Recovery. De-escalation guidance.
 """
 
+import os
 import sys
 import time
 import logging
 import threading
+
+# Allow `python main_maaa.py` from a clean clone without installing the package.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger("maaa.main")
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
+import maaa_config
 from core.maaa_agent  import MAAAAgent
 from api.maaa_api     import create_maaa_app
 from layers.l1_perception import SceneCondition
@@ -40,27 +47,29 @@ def run_demo(agent: MAAAAgent):
 
     phases = [
         ("FASE 1 — AMBIENTE NORMALE",
-         SceneCondition.NORMAL, 0.1, 0.0, 0.0, False, 10),
+         SceneCondition.NORMAL, 0.1, 0.0, 0.0, False, 0.0, 10),
         ("FASE 2 — FUMO E STRESS",
-         SceneCondition.SMOKY, 0.65, 0.35, 0.2, True, 15),
+         SceneCondition.SMOKY, 0.65, 0.35, 0.2, True, 0.0, 15),
         ("FASE 3 — CROLLO STRUTTURALE — PANICO",
-         SceneCondition.COLLAPSED, 0.9, 0.90, 0.7, True, 20),
+         SceneCondition.COLLAPSED, 0.9, 0.90, 0.7, True, 0.0, 20),
         ("FASE 4 — RECOVERY E DE-ESCALATION",
-         SceneCondition.NORMAL, 0.2, 0.0, 0.0, False, 10),
+         SceneCondition.NORMAL, 0.2, 0.0, 0.0, False, 0.0, 10),
     ]
 
     print(f"\n{DIVIDER}")
     print("  MAAA — Demo Scenario: Emergenza Terremoto")
     print(f"{DIVIDER}\n")
+    print("  TUTTI I DATI SENSORIALI SONO SINTETICI: generati da")
+    print("  layers/l1_perception.py. Nessun sensore, nessun modello visivo.\n")
     print("  Il MAAA monitora ambiente e stato cognitivo dell'utente.")
     print("  Applica 4 filtri (rilevanza, timing, brevità, urgenza)")
     print("  per minimizzare l'entropia cognitiva in condizioni critiche.\n")
 
-    for phase_name, scene, stress, panic, obs, sounds, duration_s in phases:
+    for phase_name, scene, stress, panic, obs, sounds, freeze, duration_s in phases:
         print(f"\n{'═'*70}")
         print(f"  {phase_name}")
         print(f"{'═'*70}")
-        agent.inject_scenario(scene, stress, panic, obs, sounds)
+        agent.inject_scenario(scene, stress, panic, obs, sounds, freeze)
 
         start = time.time()
         tick_interval = 0.3   # 3.3 Hz for readable demo output
@@ -96,7 +105,7 @@ def run_demo(agent: MAAAAgent):
             time.sleep(tick_interval)
 
         # Phase summary
-        print(f"\n  ── Riepilogo fase:")
+        print("\n  ── Riepilogo fase:")
         print(f"     Tick eseguiti:   {agent.tick_count}")
         stats = agent.l4.output_stats
         print(f"     Output:          {stats['outputs_delivered']} erogati, "
@@ -127,14 +136,22 @@ def run_server(agent: MAAAAgent, host: str = "0.0.0.0", port: int = 5002):
     print("    GET  /guidance       → ultimo output guidance")
     print("    GET  /memory/working → memoria working (60s)")
     print("    GET  /memory/recall  → recall autobiografica")
-    print("    POST /scenario/<n>   → inietta scenario (normal/smoky/collapsed/panic)")
-    print("    POST /tick/n/<n>     → esegui N tick\n")
+    print("    POST /scenario/<n>   → inietta scenario "
+          "(normal/smoky/dark/dusty/obstructed/collapsed/panic/frozen)")
+    print("    POST /tick/n/<n>     → esegui N tick")
+    print("    GET/POST /override   → override umano (mute/resume)\n")
     app.run(host=host, port=port, threaded=True)
 
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "demo"
+    logger.info("MAAA v%s — simulation only, all sensor data synthetic",
+                maaa_config.VERSION)
     agent = MAAAAgent(simulation_mode=True, verbose=True)
+    # There is no battery-management driver. Attach an explicitly-labelled
+    # simulated source so /status reports battery_source="simulated" rather
+    # than passing a made-up number off as a hardware reading.
+    agent.l5.set_battery_source(agent.l5.simulated_battery_source(), label="simulated")
 
     if mode == "demo":
         run_demo(agent)

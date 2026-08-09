@@ -1,27 +1,31 @@
 """
 MAAA — Layer 2: Situational Cognition (Cognizione Situazionale)
 
-Costruisce e aggiorna il Scene Graph semantico dell'ambiente in tempo reale:
-  - Object Detection e classificazione semantica (YOLOv9 in produzione)
-  - Depth Estimation → distanze da ostacoli
-  - SLAM → mappa 3D + localizzazione
-  - Risk Estimation Engine → probabilità rischio per ogni elemento del grafo
-  - Causal Inference → relazioni causa-effetto tra oggetti e rischi
-  - Event Prediction → anticipazione eventi pericolosi
+Costruisce e aggiorna il Scene Graph semantico dell'ambiente in tempo reale.
 
-Output: SceneGraph aggiornato con RiskMap per ogni elemento
+ATTENZIONE — cosa fa davvero questo layer, in questo repository:
+  - Object Detection: NON esiste. Gli oggetti sono letti da OBJECT_TEMPLATES,
+    una tabella per condizione di scena, con rumore gaussiano su distanza e
+    bearing. Nessun modello visivo viene eseguito.
+  - Depth Estimation / SLAM: NON esistono. La posa SLAM è un random walk.
+  - "Risk Estimation": un modello euristico a pesi fissi (``_compute_risk``)
+    su categoria, distanza e qualità ambientale — non un modello appreso.
+  - Event Prediction: quattro regole a soglia su fumo, integrità e allarme.
+
+Output: RiskMap con un punteggio di rischio per ogni elemento e un rischio
+globale aggregato (vedi ``_build_risk_map``).
 """
 
 from __future__ import annotations
 
 import time
-import math
 import random
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum
 
+import maaa_config
 from layers.l1_perception import PerceptionFrame, SceneCondition
 
 logger = logging.getLogger("maaa.l2_cognition")
@@ -41,12 +45,10 @@ class RiskLevel(Enum):
         return {"SAFE": 0.0, "LOW": 0.25, "MEDIUM": 0.5, "HIGH": 0.75, "CRITICAL": 1.0}[self.value]
 
 
+# Bands come from config/default.yaml via maaa_config so that this module and
+# maaa_core/risk.py classify identically — see maaa_config.risk_bands().
 RISK_THRESHOLDS = {
-    RiskLevel.SAFE:     (0.00, 0.10),
-    RiskLevel.LOW:      (0.10, 0.35),
-    RiskLevel.MEDIUM:   (0.35, 0.60),
-    RiskLevel.HIGH:     (0.60, 0.80),
-    RiskLevel.CRITICAL: (0.80, 1.00),
+    RiskLevel[name]: (lo, hi) for name, lo, hi in maaa_config.risk_bands()
 }
 
 def classify_risk(probability: float) -> RiskLevel:
@@ -139,7 +141,28 @@ OBJECT_TEMPLATES = {
         ("person",        "person",    False, False, 3.0, 60.0),
         ("window_e",      "window",    False, True,  5.0, 90.0),
     ],
+    SceneCondition.DARK: [
+        ("door_east",     "door",      False, True,  3.5, 45.0),
+        ("corridor_n",    "corridor",  False, False, 2.5, 0.0),
+        ("staircase",     "staircase", True,  False, 6.0, 270.0),   # unlit stairs = fall risk
+        ("unknown_obj",   "debris",    True,  False, 1.8, 315.0),   # unidentified low obstacle
+    ],
+    SceneCondition.DUSTY: [
+        ("exit_n",        "door",      False, True,  6.0, 10.0),
+        ("corridor_n",    "corridor",  False, False, 2.2, 0.0),
+        ("debris_low",    "debris",    True,  False, 2.5, 200.0),
+    ],
+    SceneCondition.OBSTRUCTED: [
+        ("blocked_door",  "door",      True,  False, 2.0, 0.0),
+        ("debris_pile",   "debris",    True,  False, 1.4, 20.0),
+        ("window_w",      "window",    False, True,  4.5, 180.0),
+        ("corridor_s",    "corridor",  False, False, 3.0, 180.0),
+    ],
 }
+
+#: Distance (metres) at or below which an object's risk counts at full weight
+#: in the global aggregate. Beyond it the contribution decays as 1/d.
+PROXIMITY_FULL_M = 1.5
 
 
 def _compute_risk(category: str, distance_m: float,
@@ -147,7 +170,9 @@ def _compute_risk(category: str, distance_m: float,
     """Heuristic risk model — replaced by neural risk estimator in production."""
     base_risk = {
         "debris":    0.85,
-        "staircase": 0.70 if scene == SceneCondition.COLLAPSED else 0.15,
+        "staircase": 0.70 if scene == SceneCondition.COLLAPSED
+                     else 0.45 if scene == SceneCondition.DARK
+                     else 0.15,
         "wall":      0.55 if scene == SceneCondition.COLLAPSED else 0.05,
         "door":      0.10,
         "corridor":  0.20 if scene != SceneCondition.NORMAL else 0.05,
@@ -195,6 +220,7 @@ class L2SituationalCognition:
         self._slam_x = 0.0
         self._slam_y = 0.0
         self._slam_heading = 0.0
+        self._template_fallbacks: set[SceneCondition] = set()
         logger.info("[L2] Situational Cognition initialized")
 
     def process(self, perception: PerceptionFrame) -> CognitionFrame:
@@ -237,7 +263,17 @@ class L2SituationalCognition:
 
     def _detect_objects(self, perception: PerceptionFrame) -> list[SceneObject]:
         scene = perception.video.scene_condition
-        templates = OBJECT_TEMPLATES.get(scene, OBJECT_TEMPLATES[SceneCondition.NORMAL])
+        templates = OBJECT_TEMPLATES.get(scene)
+        if templates is None:
+            # Explicit and logged: silently substituting the NORMAL scene made
+            # DARK/DUSTY/OBSTRUCTED look safe. Warn once per unmapped scene.
+            if scene not in self._template_fallbacks:
+                self._template_fallbacks.add(scene)
+                logger.warning(
+                    "[L2] No OBJECT_TEMPLATES entry for scene '%s' — "
+                    "falling back to NORMAL; risk for this scene is NOT modelled",
+                    scene.value)
+            templates = OBJECT_TEMPLATES[SceneCondition.NORMAL]
         objects = []
         for obj_id, category, is_obstacle, is_exit, dist, bearing in templates:
             # Slight noise per tick
@@ -264,15 +300,31 @@ class L2SituationalCognition:
             ))
         return objects
 
+    @staticmethod
+    def _proximity_weight(distance_m: float) -> float:
+        """1.0 at or inside PROXIMITY_FULL_M, decaying as 1/d beyond it."""
+        return max(0.0, min(1.0, PROXIMITY_FULL_M / max(distance_m, 0.3)))
+
     def _build_risk_map(self, objects: list[SceneObject],
                         perception: PerceptionFrame, ts: float) -> RiskMap:
-        global_risk = (
-            perception.video.smoke_probability * 0.35 +
-            perception.video.dust_level * 0.15 +
-            (1.0 - perception.environment_quality) * 0.25 +
-            (max((o.risk_probability for o in objects), default=0.0) * 0.25)
-        )
-        global_risk = min(1.0, global_risk + random.gauss(0, 0.01))
+        # Global risk = 45% environmental degradation + 55% proximity-weighted
+        # worst-case object hazard.
+        #
+        # The previous version was a flat weighted sum in which the worst object
+        # contributed at most 0.25, so a CRITICAL hazard 1.2 m away was diluted
+        # by the average haze: the aggregate could not exceed ~0.744 under any
+        # injected scenario and the CRITICAL band (>=0.80) was unreachable.
+        # A hazard you are standing next to has to be able to drive the
+        # aggregate on its own — that is what the second term does.
+        env_degradation = min(1.0, (
+            perception.video.smoke_probability * 0.40 +
+            perception.video.dust_level * 0.20 +
+            (1.0 - perception.environment_quality) * 0.40
+        ))
+        hazard = max((o.risk_probability * self._proximity_weight(o.distance_m)
+                      for o in objects), default=0.0)
+        global_risk = env_degradation * 0.45 + hazard * 0.55
+        global_risk = max(0.0, min(1.0, global_risk + random.gauss(0, 0.01)))
 
         # Passable directions: bearings without critical obstacles nearby
         blocked = {o.bearing_deg for o in objects

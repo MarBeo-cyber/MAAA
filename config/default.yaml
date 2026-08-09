@@ -8,10 +8,38 @@ maaa:
     offline_first: true
     human_override: true
     raw_video_cloud_upload: false
+  # Shared risk bands. Consumed by layers/l2_cognition.py (RISK_THRESHOLDS)
+  # and maaa_core/risk.py so both implementations classify identically.
+  #   SAFE [0, low) LOW [low, medium) MEDIUM [medium, high)
+  #   HIGH [high, critical) CRITICAL [critical, 1]
   risk_thresholds:
+    low: 0.10
     medium: 0.35
-    high: 0.65
-    critical: 0.85
+    high: 0.60
+    critical: 0.80
+  # Gates for layers/l3_human_state.py. Calibrated against the ranges the
+  # synthetic generator in layers/l1_perception.py can actually produce —
+  # see docs/ARCHITECTURE.md "Calibration" and tests/test_reachability.py.
+  human_state_thresholds:
+    alert: 0.30
+    stressed: 0.60
+    overloaded: 0.70
+    frozen: 0.65
+    collapsed: 0.75
+    panicking: 0.75
+    is_critical_panic: 0.75
+    is_critical_freeze: 0.65
+    is_critical_attentional: 0.75
+    immediate_override_panic: 0.78
+    immediate_override_overload: 0.80
+  failsafe:
+    battery_min_pct: 5.0
+    battery_warn_pct: 20.0
+    sensor_integrity_min: 0.45
+    max_latency_ms: 200.0
+    stage_latency_max_ms: 150.0
+    heartbeat_timeout_s: 2.0
+    recovery_cycles: 10
   resource_governor:
     llm_in_primary_emergency_loop: false
     local_models_only_default: true

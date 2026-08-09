@@ -4,11 +4,21 @@ from .models import SensorFrame, HumanState
 
 
 class HumanStateEstimator:
-    """L3 - estimates stress, overload, panic and attentional collapse.
+    """L3 — cognitive-entropy proxy over caller-supplied scalars.
 
-    Prototype: uses simulated audio stress, IMU instability and gaze fixation.
-    Production: voice stress, HRV/GSR from PAAA, eye tracking, micro-expression
-    and motion pattern features.
+    No sensor is consumed and no state is detected. ``stress`` and
+    ``attention_collapse`` are identity passthroughs of ``frame.audio_stress``
+    and ``frame.gaze_fixation_risk``; ``overload`` and ``panic`` are two fixed
+    weighted sums of the same three numbers. Those three numbers are invented
+    by whoever constructs the SensorFrame.
+
+    ``HumanState.cognitive_entropy`` is the single quantity this layer exists
+    to produce: one scalar summarising how much the guidance should be
+    simplified. It is a design proxy, not a measurement, and it has never been
+    validated against a human subject.
+
+    A real implementation would need voice-stress features, HRV/GSR, eye
+    tracking and motion patterns — none of which exist here.
     """
 
     def estimate(self, frame: SensorFrame) -> HumanState:

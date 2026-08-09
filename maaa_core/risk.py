@@ -1,20 +1,33 @@
 from __future__ import annotations
 
+import maaa_config
 from .models import SceneGraph, RiskLevel
 
 
 class RiskEstimationEngine:
-    """L2 - estimates risk level from the scene graph."""
+    """L2 — threshold classifier over caller-supplied hazard scores.
+
+    This does not estimate anything. ``SceneGraphBuilder`` copies the floats in
+    ``SensorFrame.hazards`` into the graph unchanged, and ``score()`` returns
+    the largest of them and puts it in a band. Given
+    ``hazards={"a": 0.42, "b": 0.77}`` it returns ``(0.77, HIGH, "b")``.
+    The hazard numbers are invented by whoever builds the SensorFrame — there
+    is no perception, no model and no inference between input and output.
+
+    The bands are shared with ``layers.l2_cognition`` via
+    ``config/default.yaml`` so the two implementations classify identically.
+    """
+
+    def __init__(self) -> None:
+        # Descending order so the first match wins.
+        self._bands = sorted(maaa_config.risk_bands(), key=lambda b: -b[1])
 
     def score(self, graph: SceneGraph) -> tuple[float, RiskLevel, str | None]:
         item, risk = graph.highest_risk()
-        if risk >= 0.85:
-            return risk, RiskLevel.CRITICAL, item
-        if risk >= 0.65:
-            return risk, RiskLevel.HIGH, item
-        if risk >= 0.35:
-            return risk, RiskLevel.MEDIUM, item
-        return risk, RiskLevel.LOW, item
+        for name, lo, _hi in self._bands:
+            if risk >= lo:
+                return risk, RiskLevel[name], item
+        return risk, RiskLevel.SAFE, item
 
     def best_safe_path(self, graph: SceneGraph) -> str | None:
         candidates = [

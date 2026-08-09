@@ -1,5 +1,21 @@
-from maaa_core.models import SensorFrame, AutopoieticStatus
-from maaa_core.orchestrator import MAAAOrchestrator
+"""Minimal reference-core demo (maaa_core).
+
+Every number below is typed in by hand. The "risk 0.91 CRITICAL" the demo
+prints is the 0.91 written into `hazards` three lines above it — the pipeline
+classifies that number into a band, it does not estimate it. See README.md.
+
+For the full runtime (five layers, REST API, SQLite memory) run:
+    python main_maaa.py demo
+"""
+
+import os
+import sys
+
+# Allow `python examples/run_demo.py` from a clean clone without installing.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from maaa_core.models import SensorFrame, AutopoieticStatus     # noqa: E402
+from maaa_core.orchestrator import MAAAOrchestrator             # noqa: E402
 
 maaa = MAAAOrchestrator(max_words=9)
 

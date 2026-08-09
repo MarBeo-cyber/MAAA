@@ -17,14 +17,18 @@ from __future__ import annotations
 
 import time
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from layers.l2_cognition import CognitionFrame, RiskLevel, SceneCondition
-from layers.l3_human_state import HumanStateFrame, CognitiveState
+import maaa_config
+from layers.l2_cognition import CognitionFrame, RiskLevel, RISK_THRESHOLDS
+from layers.l3_human_state import HumanStateFrame
 
 logger = logging.getLogger("maaa.l4_regulation")
+
+#: Commands accepted by the human-override channel (NFR-05, docs/SAFETY.md).
+OVERRIDE_COMMANDS = ("mute", "resume", "clear")
 
 
 # ── Output Models ─────────────────────────────────────────────────────────────
@@ -121,10 +125,13 @@ class RelevanceFilter:
         new_critical = cognition.risk_map.get_critical_objects() and self._last_risk < 0.6
 
         if risk_changed or bearing_changed or new_critical:
+            # Build the reason BEFORE overwriting _last_risk — the assignment
+            # used to happen first, so the delta was always reported as 0.00.
+            reason = f"risk_delta={abs(risk - self._last_risk):.2f}"
             self._last_risk = risk
             self._last_bearing = bearing
             self._last_message = proposed_message
-            return True, f"risk_delta={abs(risk - self._last_risk):.2f}"
+            return True, reason
 
         if proposed_message == self._last_message:
             return False, "identical_to_last_message"
@@ -193,43 +200,137 @@ class BrevityFilter:
     In production: backed by LLM with system prompt for ultra-brief instructions.
     """
 
-    MAX_WORDS = 9
+    MAX_WORDS = maaa_config.max_words()
 
-    # Urgency-level message templates
+    # Urgency-level message templates. These are the messages the system
+    # actually speaks: `generate()` selects one deterministically from the
+    # current risk map, and `shorten()` falls back to one when a message
+    # exceeds the word budget. Braced fields are filled from the scene.
     TEMPLATES = {
         UrgencyLevel.CRITICAL: [
-            "FERMATI.",
-            "Non muoverti.",
-            "Scendi subito.",
-            "Esci ora.",
-            "Dietro! Pericolo.",
+            "FERMATI.",                                    # 0 no passable direction
+            "Non muoverti.",                               # 1 critical hazard within 2 m
+            "Scendi subito.",                              # 2 exit is a staircase
+            "Esci ora.",                                   # 3 exit available
+            "Dietro! Pericolo.",                           # 4 critical hazard behind
+            "PERICOLO {obstacle}. Non avvicinarti.",       # 5 named critical hazard
         ],
         UrgencyLevel.ELEVATED: [
-            "Gira a destra. Uscita a {dist:.0f} metri.",
-            "Evita {obstacle}. Passa a sinistra.",
-            "Accelera. Uscita vicina.",
-            "Abbassati. Fumo in arrivo.",
+            "Gira a destra. Uscita a {dist:.0f} metri.",   # 0 exit on the right
+            "Evita {obstacle}. Passa a sinistra.",         # 1 obstacle, no exit
+            "Accelera. Uscita vicina.",                    # 2 exit within 3 m
+            "Abbassati. Fumo in arrivo.",                  # 3 smoke rising
+            "Uscita a {bearing:.0f} gradi, {dist:.0f} metri. Muoviti.",  # 4 exit elsewhere
+            "Allontanati dalla zona pericolosa.",          # 5 nothing else to say
         ],
         UrgencyLevel.NORMAL: [
-            "Procedi avanti per {dist:.0f} metri.",
-            "Uscita a destra. Rischio basso.",
-            "Situazione stabile. Continua.",
-            "Gira a {bearing:.0f} gradi. Percorso libero.",
+            "Procedi avanti per {dist:.0f} metri.",        # 0 exit ahead
+            "Uscita a destra. Rischio basso.",             # 1 exit on the right
+            "Situazione stabile. Continua.",               # 2 risk below MEDIUM
+            "Gira a {bearing:.0f} gradi. Percorso libero.",# 3 recommended bearing only
+            "Ambiente stabile. Continua a monitorare.",    # 4 fallback
         ],
         UrgencyLevel.AMBIENT: [
-            "Ambiente monitorato.",
-            "Nessuna minaccia immediata.",
+            "Ambiente monitorato.",                        # 0 a HIGH object is present
+            "Nessuna minaccia immediata.",                 # 1 nothing of note
+        ],
+        UrgencyLevel.SILENT: [
+            "Sistema attivo.",
         ],
     }
 
+    @staticmethod
+    def _is_behind(bearing_deg: float) -> bool:
+        return abs((bearing_deg % 360) - 180.0) < 45.0
+
+    @staticmethod
+    def _is_right(bearing_deg: float) -> bool:
+        return 0.0 < (bearing_deg % 360) < 180.0
+
+    def select_template(self, urgency: UrgencyLevel,
+                        cognition: CognitionFrame) -> str:
+        """Pick and fill the curated message that fits the current scene.
+
+        Deterministic: the same risk map always yields the same message, which
+        the relevance filter relies on to detect "nothing has changed".
+        """
+        rm = cognition.risk_map
+        templates = self.TEMPLATES[urgency]
+        exits = rm.get_exits()
+        criticals = rm.get_critical_objects()
+        obstacles = sorted((o for o in rm.objects if o.is_obstacle),
+                           key=lambda o: o.distance_m)
+
+        # An exit is only worth naming if it is not itself a hazard.
+        safe_exits = [o for o in exits if o.risk_level in
+                      (RiskLevel.SAFE, RiskLevel.LOW, RiskLevel.MEDIUM)]
+
+        if urgency == UrgencyLevel.CRITICAL:
+            if criticals and self._is_behind(criticals[0].bearing_deg):
+                return templates[4]
+            if not rm.passable_directions:
+                return templates[0]
+            # Prefer egress over immobility: "Non muoverti." is only right when
+            # there is nowhere safe to go.
+            if safe_exits and safe_exits[0].category == "staircase":
+                return templates[2]
+            if safe_exits:
+                return templates[3]
+            if criticals and min(o.distance_m for o in criticals) < 2.0:
+                return templates[1]
+            if criticals:
+                return templates[5].format(obstacle=criticals[0].category.upper())
+            return templates[0]
+
+        if urgency == UrgencyLevel.ELEVATED:
+            if "smoke_increasing" in cognition.event_predictions:
+                return templates[3]
+            if exits and exits[0].distance_m < 3.0:
+                return templates[2]
+            if exits and self._is_right(exits[0].bearing_deg):
+                return templates[0].format(dist=exits[0].distance_m)
+            if exits:
+                return templates[4].format(bearing=exits[0].bearing_deg % 360,
+                                           dist=exits[0].distance_m)
+            if obstacles:
+                return templates[1].format(obstacle=obstacles[0].category)
+            return templates[5]
+
+        if urgency == UrgencyLevel.NORMAL:
+            if exits and self._is_right(exits[0].bearing_deg):
+                return templates[1]
+            if exits:
+                return templates[0].format(dist=exits[0].distance_m)
+            if rm.recommended_path_bearing is not None:
+                return templates[3].format(bearing=rm.recommended_path_bearing % 360)
+            if rm.global_risk < RISK_THRESHOLDS[RiskLevel.MEDIUM][0]:
+                return templates[2]
+            return templates[4]
+
+        if urgency == UrgencyLevel.AMBIENT:
+            has_high = any(o.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL)
+                           for o in rm.objects)
+            return templates[0] if has_high else templates[1]
+
+        return templates[0]
+
     def shorten(self, message: str, urgency: UrgencyLevel,
                 cognition: CognitionFrame) -> str:
-        """Ensure message fits in 7–9 words with imperative syntax."""
+        """Ensure message fits in 7–9 words with imperative syntax.
+
+        An over-long message is replaced by the curated template for this
+        urgency rather than truncated mid-sentence — truncation destroys the
+        imperative the filter exists to preserve. Both parameters are used;
+        the previous implementation ignored them and just cut the word list.
+        """
         words = message.split()
         if len(words) <= self.MAX_WORDS:
             return message
 
-        # Truncate and ensure imperative
+        fallback = self.select_template(urgency, cognition)
+        if len(fallback.split()) <= self.MAX_WORDS:
+            return fallback
+
         shortened = " ".join(words[:self.MAX_WORDS])
         if not shortened.endswith("."):
             shortened += "."
@@ -237,33 +338,8 @@ class BrevityFilter:
 
     def generate(self, urgency: UrgencyLevel,
                  cognition: CognitionFrame) -> str:
-        """Generate a contextual brief message."""
-        risk_map = cognition.risk_map
-        exits = risk_map.get_exits()
-
-        if urgency == UrgencyLevel.CRITICAL:
-            criticals = risk_map.get_critical_objects()
-            if criticals:
-                return f"PERICOLO {criticals[0].category.upper()}. Non avvicinarti."
-            return "PERICOLO IMMINENTE. Fermati."
-
-        if urgency == UrgencyLevel.ELEVATED:
-            if exits:
-                exit_obj = exits[0]
-                return (f"Uscita a {exit_obj.bearing_deg:.0f}°, "
-                        f"{exit_obj.distance_m:.0f} metri. Muoviti.")
-            return "Allontanati dalla zona pericolosa."
-
-        if urgency == UrgencyLevel.NORMAL:
-            if exits:
-                exit_obj = exits[0]
-                return (f"Procedi verso uscita. "
-                        f"{exit_obj.distance_m:.0f} metri a destra.")
-            if risk_map.recommended_path_bearing is not None:
-                return f"Percorso consigliato: {risk_map.recommended_path_bearing:.0f} gradi."
-            return "Ambiente stabile. Continua a monitorare."
-
-        return "Sistema attivo."
+        """Generate a contextual brief message from the curated templates."""
+        return self.select_template(urgency, cognition)
 
 
 class UrgencyFilter:
@@ -274,6 +350,17 @@ class UrgencyFilter:
     Never de-escalates faster than the situation warrants.
     """
 
+    RISK_LOW      = RISK_THRESHOLDS[RiskLevel.LOW][0]
+    RISK_MEDIUM   = RISK_THRESHOLDS[RiskLevel.MEDIUM][0]
+    RISK_HIGH     = RISK_THRESHOLDS[RiskLevel.HIGH][0]
+    RISK_CRITICAL = RISK_THRESHOLDS[RiskLevel.CRITICAL][0]
+
+    # Human-state gates. Calibrated against the ranges L3 can produce; see
+    # docs/ARCHITECTURE.md "Calibration".
+    PANIC_CRITICAL     = 0.85
+    OVERLOAD_ELEVATED  = 0.70
+    STRESS_NORMAL      = 0.55
+
     def __init__(self):
         self._prev_urgency = UrgencyLevel.SILENT
         self._peak_risk = 0.0
@@ -283,14 +370,15 @@ class UrgencyFilter:
         risk = cognition.risk_map.global_risk
         self._peak_risk = max(self._peak_risk, risk)
 
-        # Absolute thresholds
-        if risk > 0.80 or human.panic_score > 0.85:
+        # Risk gates are the shared bands from config/default.yaml, so urgency
+        # and RiskLevel can never drift apart.
+        if risk >= self.RISK_CRITICAL or human.panic_score > self.PANIC_CRITICAL:
             urgency = UrgencyLevel.CRITICAL
-        elif risk > 0.60 or human.cognitive_overload > 0.70:
+        elif risk >= self.RISK_HIGH or human.cognitive_overload > self.OVERLOAD_ELEVATED:
             urgency = UrgencyLevel.ELEVATED
-        elif risk > 0.35 or human.stress_score > 0.55:
+        elif risk >= self.RISK_MEDIUM or human.stress_score > self.STRESS_NORMAL:
             urgency = UrgencyLevel.NORMAL
-        elif risk > 0.10:
+        elif risk >= self.RISK_LOW:
             urgency = UrgencyLevel.AMBIENT
         else:
             urgency = UrgencyLevel.SILENT
@@ -326,7 +414,34 @@ class L4SymbioticRegulation:
         self.urgency_filter   = UrgencyFilter()
         self._output_count    = 0
         self._suppressed_count = 0
+        self._override: Optional[str] = None
         logger.info("[L4] Symbiotic Regulatory Engine initialized")
+
+    # ── Human override (NFR-05, docs/SAFETY.md) ───────────────────────────────
+
+    def set_override(self, command: Optional[str]) -> Optional[str]:
+        """Apply a human override command; returns the override now in force.
+
+        ``mute``   — silence guidance below CRITICAL urgency.
+        ``resume`` / ``clear`` / ``None`` — remove the override.
+
+        ``mute`` deliberately does NOT silence CRITICAL urgency: the user can
+        switch off advice, not the collision warning. This limit is stated in
+        docs/SAFETY.md.
+        """
+        if command in (None, "resume", "clear"):
+            self._override = None
+        elif command == "mute":
+            self._override = "mute"
+        else:
+            raise ValueError(f"unknown override command '{command}'; "
+                             f"expected one of {OVERRIDE_COMMANDS}")
+        logger.info("[L4] Human override set to %s", self._override)
+        return self._override
+
+    @property
+    def override(self) -> Optional[str]:
+        return self._override
 
     def regulate(self, cognition: CognitionFrame,
                  human: HumanStateFrame) -> GuidanceOutput:
@@ -336,6 +451,12 @@ class L4SymbioticRegulation:
         # ── Filter 4: Urgency (determines tone BEFORE content) ────────────────
         urgency = self.urgency_filter.compute(cognition, human)
         filter_log.append(f"urgency={urgency.name}")
+
+        # ── Human override ────────────────────────────────────────────────────
+        if self._override == "mute" and urgency.value < UrgencyLevel.CRITICAL.value:
+            filter_log.append("override=mute")
+            return self._suppressed_output(ts, urgency, "", filter_log,
+                                           "user_override_mute")
 
         # ── Filter 3: Brevity (generate the message) ──────────────────────────
         full_message = self.brevity_filter.generate(urgency, cognition)

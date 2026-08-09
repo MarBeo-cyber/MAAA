@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maaa"
+description = "MAAA — Metacognitive Autopoietic Adaptive Agent (architecture demonstrator, synthetic data only)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dynamic = ["version"]
+dependencies = [
+    "pyyaml>=6.0",
+    "numpy>=1.24",   # layers/l5_continuity.py — cosine recall
+    "flask>=3.0",    # api/maaa_api.py — REST API
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+maaa = "main_maaa:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "maaa_config.VERSION"}
+
+[tool.setuptools]
+# Flat layout: the repository root is the package root.
+py-modules = ["maaa_config", "main_maaa"]
+
+[tool.setuptools.packages.find]
+include = ["maaa_core*", "layers*", "core*", "api*", "memory*", "output*", "sensors*"]
+exclude = ["tests*", "docs*", "web*", "examples*", "release*", "config*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Makes a bare `pytest` work from a clean clone with no install step.
+pythonpath = ["."]
+addopts = "-ra"

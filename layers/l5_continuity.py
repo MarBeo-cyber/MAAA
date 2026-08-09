@@ -19,22 +19,23 @@ Memoria a 3 livelli (Sez. 6 del documento):
 from __future__ import annotations
 
 import time
-import math
 import json
 import uuid
+import shutil
+import hashlib
 import sqlite3
 import logging
 import threading
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Callable, Optional
 from collections import deque
-from pathlib import Path
 
 import numpy as np
 
+import maaa_config
 from layers.l2_cognition import CognitionFrame, RiskLevel
 from layers.l3_human_state import HumanStateFrame, CognitiveState
-from layers.l4_regulation import GuidanceOutput, UrgencyLevel
+from layers.l4_regulation import GuidanceOutput
 
 logger = logging.getLogger("maaa.l5_continuity")
 
@@ -121,6 +122,7 @@ class EpisodicMemory:
     def __init__(self, db_path: str = "/tmp/maaa_episodes.db"):
         self.db_path = db_path
         self.session_id = str(uuid.uuid4())[:8]
+        self.last_error: Optional[str] = None
         self._conn = self._init_db()
         self._lock = threading.Lock()
         logger.info("[L5/EpisodicMem] Session %s started, db=%s",
@@ -165,6 +167,17 @@ class EpisodicMemory:
             ))
             self._conn.commit()
 
+    def healthy(self) -> bool:
+        """Probe the store. Feeds SystemHealth.memory_ok (NFR-08 auditability)."""
+        try:
+            with self._lock:
+                self._conn.execute("SELECT 1 FROM episodes LIMIT 1").fetchone()
+            self.last_error = None
+            return True
+        except (sqlite3.Error, AttributeError) as exc:
+            self.last_error = str(exc)
+            return False
+
     def get_session_events(self, limit: int = 200) -> list[MemoryEvent]:
         with self._lock:
             rows = self._conn.execute("""
@@ -173,11 +186,16 @@ class EpisodicMemory:
         return [self._row_to_event(r) for r in rows]
 
     def count_by_type(self) -> dict[str, int]:
-        with self._lock:
-            rows = self._conn.execute("""
-                SELECT event_type, COUNT(*) FROM episodes
-                WHERE session_id=? GROUP BY event_type
-            """, (self.session_id,)).fetchall()
+        try:
+            with self._lock:
+                rows = self._conn.execute("""
+                    SELECT event_type, COUNT(*) FROM episodes
+                    WHERE session_id=? GROUP BY event_type
+                """, (self.session_id,)).fetchall()
+        except sqlite3.Error as exc:
+            # A degraded store must not take /status and /session down with it.
+            self.last_error = str(exc)
+            return {}
         return dict(rows)
 
     def _row_to_event(self, row) -> MemoryEvent:
@@ -192,7 +210,10 @@ class EpisodicMemory:
 
     def close(self):
         with self._lock:
-            self._conn.close()
+            try:
+                self._conn.close()
+            except sqlite3.Error as exc:      # already closed / never opened
+                self.last_error = str(exc)
 
 
 # ── Autobiographical Memory (persistent, vector similarity) ───────────────────
@@ -212,6 +233,7 @@ class AutobiographicalMemory:
         self.storage_path = storage_path
         self._memories: list[dict] = []
         self._vectors: list[list[float]] = []
+        self.load_error: Optional[str] = None
         self._load()
         logger.info("[L5/AutobioMem] Loaded %d long-term memories", len(self._memories))
 
@@ -221,8 +243,21 @@ class AutobiographicalMemory:
                 data = json.load(f)
                 self._memories = data.get("memories", [])
                 self._vectors  = data.get("vectors", [])
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
+        except FileNotFoundError:
+            logger.info("[L5/AutobioMem] No store at %s — starting empty",
+                        self.storage_path)
+        except (json.JSONDecodeError, OSError) as exc:
+            # A corrupt store used to be swallowed silently, so the agent came
+            # up with an empty long-term memory and no trace of why.
+            backup = f"{self.storage_path}.corrupt-{int(time.time())}"
+            try:
+                shutil.copy(self.storage_path, backup)
+            except OSError:
+                backup = "<backup failed>"
+            logger.error("[L5/AutobioMem] Store %s unreadable (%s) — "
+                         "starting empty, original kept at %s",
+                         self.storage_path, exc, backup)
+            self.load_error = str(exc)
 
     def _save(self):
         try:
@@ -231,11 +266,23 @@ class AutobiographicalMemory:
         except Exception as e:
             logger.warning("[L5/AutobioMem] Save failed: %s", e)
 
+    @staticmethod
+    def stable_hash_unit(text: str) -> float:
+        """Deterministic [0,1) hash of a string, stable across processes.
+
+        Python's built-in hash() is salted per interpreter (PYTHONHASHSEED),
+        so the same state summary embedded in three different runs produced
+        0.8 / 0.7 / 0.32 and vectors persisted to disk were not comparable with
+        vectors computed after a restart.
+        """
+        digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+        return (int.from_bytes(digest, "big") % 1000) / 1000.0
+
     def _embed(self, event: MemoryEvent) -> list[float]:
         """Compact feature embedding (production: call LLM embedding API)."""
         risk_num = {"SAFE": 0.0, "LOW": 0.25, "MEDIUM": 0.5,
                     "HIGH": 0.75, "CRITICAL": 1.0}.get(event.risk_level, 0.0)
-        state_num = hash(event.human_state_summary) % 100 / 100.0
+        state_num = self.stable_hash_unit(event.human_state_summary)
         ts_norm = (event.timestamp % 86400) / 86400.0   # Time of day
         return [
             risk_num, state_num, ts_norm,
@@ -288,6 +335,15 @@ class AutobiographicalMemory:
 # ── System Health Monitor ─────────────────────────────────────────────────────
 
 @dataclass
+class Heartbeat:
+    """Last report from one pipeline stage."""
+    timestamp: float
+    ok: bool
+    latency_ms: float
+    detail: str = ""
+
+
+@dataclass
 class SystemHealth:
     timestamp: float
     loop_latency_ms: float
@@ -296,14 +352,21 @@ class SystemHealth:
     l3_ok: bool
     l4_ok: bool
     memory_ok: bool
-    battery_pct: float
+    #: None when no battery source is attached — this build has no BMS driver.
+    battery_pct: Optional[float]
     offline_mode: bool
     failsafe_active: bool
     warnings: list[str] = field(default_factory=list)
+    #: Why the system counts as degraded. Empty means healthy.
+    degraded_reasons: list[str] = field(default_factory=list)
+    #: "unavailable" | "simulated" | "hardware"
+    battery_source: str = "unavailable"
 
     @property
     def is_degraded(self) -> bool:
-        return not all([self.sensor_ok, self.l2_ok, self.l3_ok, self.l4_ok])
+        return (not all([self.sensor_ok, self.l2_ok, self.l3_ok,
+                         self.l4_ok, self.memory_ok])
+                or bool(self.degraded_reasons))
 
     @property
     def overall_health(self) -> float:
@@ -327,7 +390,9 @@ class L5AutopoieticContinuity:
 
     LATENCY_WARN_MS  = 150.0
     LATENCY_CRIT_MS  = 250.0
-    BATTERY_WARN_PCT = 20.0
+
+    #: Stages that must report a heartbeat every cycle for the system to be healthy.
+    COMPONENTS = ("sensor", "l2", "l3", "l4")
 
     def __init__(self, db_path: str = "/tmp/maaa_episodes.db",
                  autobio_path: str = "/tmp/maaa_autobio.json"):
@@ -338,8 +403,53 @@ class L5AutopoieticContinuity:
         self._loop_latencies: deque[float] = deque(maxlen=30)
         self._system_start       = time.time()
         self._failsafe_active    = False
+        self._heartbeats: dict[str, Heartbeat] = {}
+        self._memory_error: Optional[str] = None
+        self._healthy_streak     = 0
+        self._battery_source_fn: Optional[Callable[[], float]] = None
+        self._battery_source_label = "unavailable"
+
+        self.BATTERY_WARN_PCT = maaa_config.failsafe_setting("battery_warn_pct", 20.0)
+        self.BATTERY_MIN_PCT  = maaa_config.failsafe_setting("battery_min_pct", 5.0)
+        self.HEARTBEAT_TIMEOUT_S = maaa_config.failsafe_setting("heartbeat_timeout_s", 2.0)
+        self.STAGE_LATENCY_MAX_MS = maaa_config.failsafe_setting("stage_latency_max_ms", 150.0)
+        self.RECOVERY_CYCLES = int(maaa_config.failsafe_setting("recovery_cycles", 10))
+
         logger.info("[L5] Autopoietic Continuity initialized. Session: %s",
                     self.episodic_memory.session_id)
+
+    # ── Heartbeats ────────────────────────────────────────────────────────────
+
+    def report_heartbeat(self, component: str, ok: bool = True,
+                         latency_ms: float = 0.0, detail: str = ""):
+        """Called by the orchestrator after each pipeline stage runs.
+
+        Health used to be hard-coded True for every component, so is_degraded
+        was always False and _activate_failsafe was dead code. Now a stage that
+        raises, stalls or blows its latency budget stops being 'ok' here.
+        """
+        self._heartbeats[component] = Heartbeat(time.time(), ok, latency_ms, detail)
+
+    def set_battery_source(self, source: Optional[Callable[[], float]],
+                           label: str = "hardware"):
+        """Attach a battery-percentage source.
+
+        There is no battery-management driver in this repository. Until a
+        source is attached, battery_pct is None and battery_source is
+        "unavailable" — the previous build reported ``100 - uptime_h * 25`` as
+        if it were a real reading.
+        """
+        self._battery_source_fn = source
+        self._battery_source_label = label if source is not None else "unavailable"
+
+    def simulated_battery_source(self, endurance_hours: float = 4.0) -> Callable[[], float]:
+        """A clearly-labelled fake battery for demos. Never call this 'hardware'."""
+        start = self._system_start
+
+        def _read() -> float:
+            elapsed_h = (time.time() - start) / 3600.0
+            return max(0.0, 100.0 - elapsed_h * (100.0 / endurance_hours))
+        return _read
 
     def process(self,
                 cognition: CognitionFrame,
@@ -365,6 +475,12 @@ class L5AutopoieticContinuity:
         # ── Activate failsafe if needed ───────────────────────────────────────
         if health.is_degraded:
             self._activate_failsafe(health)
+        else:
+            self._clear_failsafe(health)
+        # Report the state as of the end of this cycle, not the start: the
+        # snapshot used to say failsafe_active=False on the very tick that
+        # activated it.
+        health.failsafe_active = self._failsafe_active
 
         # ── Periodic autobiographical flush ───────────────────────────────────
         if self._tick % 100 == 0:
@@ -372,26 +488,48 @@ class L5AutopoieticContinuity:
 
         return health
 
+    def _safe_episodic_add(self, event: MemoryEvent):
+        """Write to SQLite, recording the failure instead of hiding it."""
+        try:
+            self.episodic_memory.add(event)
+            self._memory_error = None
+        except sqlite3.Error as exc:
+            self._memory_error = str(exc)
+            logger.error("[L5] Episodic write failed: %s", exc)
+
     def _record_guidance(self, guidance: GuidanceOutput,
                          human: HumanStateFrame,
                          cognition: CognitionFrame):
-        if guidance.suppressed or not guidance.voice_message:
-            return
+        """Log the guidance decision — delivered OR suppressed.
+
+        NFR-08 requires every guidance event to be logged. This used to return
+        early on suppressed output, so the ~98% of cycles the relevance and
+        timing filters silence left no trace at all: the audit trail recorded
+        only what the user heard, never what the system chose not to say.
+        """
+        delivered = not guidance.suppressed and bool(guidance.voice_message)
+        content: dict = {
+            "urgency":  guidance.urgency.name,
+            "filters":  guidance.filter_log,
+        }
+        if delivered:
+            content["message"] = guidance.voice_message
+            content["channels"] = [c.value for c in guidance.active_channels]
+        else:
+            content["candidate_message"] = guidance.voice_message_full
+            content["suppression_reason"] = guidance.suppression_reason
+
         event = MemoryEvent(
             event_id=str(uuid.uuid4()),
             timestamp=guidance.timestamp,
             session_id=self.episodic_memory.session_id,
-            event_type="guidance_delivered",
-            content={
-                "message": guidance.voice_message,
-                "urgency":  guidance.urgency.name,
-                "channels": [c.value for c in guidance.active_channels],
-            },
+            event_type="guidance_delivered" if delivered else "guidance_suppressed",
+            content=content,
             human_state_summary=human.state.value,
             risk_level=cognition.risk_map.global_risk_level.value,
         )
         self.working_memory.add(event)
-        self.episodic_memory.add(event)
+        self._safe_episodic_add(event)
 
     def _record_risk_events(self, cognition: CognitionFrame,
                             human: HumanStateFrame):
@@ -414,7 +552,7 @@ class L5AutopoieticContinuity:
                     gps_lon=cognition.slam.position_y,
                 )
                 self.working_memory.add(event)
-                self.episodic_memory.add(event)
+                self._safe_episodic_add(event)
 
     def _record_human_state(self, human: HumanStateFrame,
                             cognition: CognitionFrame):
@@ -436,43 +574,111 @@ class L5AutopoieticContinuity:
                     risk_level=cognition.risk_map.global_risk_level.value,
                 )
                 self.working_memory.add(event)
-                self.episodic_memory.add(event)
+                self._safe_episodic_add(event)
+
+    def _component_ok(self, component: str, now: float,
+                      reasons: list[str]) -> bool:
+        """Derive one component flag from its most recent heartbeat."""
+        hb = self._heartbeats.get(component)
+        if hb is None:
+            reasons.append(f"{component}_no_heartbeat")
+            return False
+        age = now - hb.timestamp
+        if not hb.ok:
+            reasons.append(f"{component}_error:{hb.detail or 'unknown'}")
+            return False
+        if age > self.HEARTBEAT_TIMEOUT_S:
+            reasons.append(f"{component}_heartbeat_stale:{age:.1f}s")
+            return False
+        if hb.latency_ms > self.STAGE_LATENCY_MAX_MS:
+            reasons.append(f"{component}_latency:{hb.latency_ms:.0f}ms")
+            return False
+        return True
 
     def _assess_health(self, loop_latency_ms: float, ts: float) -> SystemHealth:
-        warnings = []
+        warnings: list[str] = []
+        reasons: list[str] = []
         avg_latency = (sum(self._loop_latencies) / len(self._loop_latencies)
                        if self._loop_latencies else 0.0)
 
         if avg_latency > self.LATENCY_CRIT_MS:
             warnings.append(f"latency_critical:{avg_latency:.0f}ms")
+            reasons.append(f"loop_latency_critical:{avg_latency:.0f}ms")
         elif avg_latency > self.LATENCY_WARN_MS:
             warnings.append(f"latency_warning:{avg_latency:.0f}ms")
 
-        # Simulate battery drain
-        elapsed_h = (ts - self._system_start) / 3600.0
-        battery_pct = max(0.0, 100.0 - elapsed_h * 25.0)  # ~4h endurance
-        if battery_pct < self.BATTERY_WARN_PCT:
-            warnings.append(f"battery_low:{battery_pct:.0f}%")
+        flags = {c: self._component_ok(c, ts, reasons) for c in self.COMPONENTS}
+
+        memory_ok = self._memory_error is None and self.episodic_memory.healthy()
+        if not memory_ok:
+            detail = self._memory_error or self.episodic_memory.last_error or "probe_failed"
+            reasons.append(f"memory_error:{detail}")
+            warnings.append("memory_unavailable")
+
+        battery_pct: Optional[float] = None
+        if self._battery_source_fn is not None:
+            try:
+                battery_pct = float(self._battery_source_fn())
+            except Exception as exc:                      # noqa: BLE001 — source is external
+                reasons.append(f"battery_source_error:{exc}")
+                warnings.append("battery_source_error")
+        if battery_pct is not None:
+            if battery_pct < self.BATTERY_MIN_PCT:
+                warnings.append(f"battery_critical:{battery_pct:.0f}%")
+                reasons.append(f"battery_critical:{battery_pct:.0f}%")
+            elif battery_pct < self.BATTERY_WARN_PCT:
+                warnings.append(f"battery_low:{battery_pct:.0f}%")
 
         return SystemHealth(
             timestamp=ts,
             loop_latency_ms=loop_latency_ms,
-            sensor_ok=True,   # Production: check each adapter's heartbeat
-            l2_ok=True,
-            l3_ok=True,
-            l4_ok=True,
-            memory_ok=True,
+            sensor_ok=flags["sensor"],
+            l2_ok=flags["l2"],
+            l3_ok=flags["l3"],
+            l4_ok=flags["l4"],
+            memory_ok=memory_ok,
             battery_pct=battery_pct,
-            offline_mode=False,
+            offline_mode=bool(maaa_config.get("maaa.safety.offline_first", True)),
             failsafe_active=self._failsafe_active,
             warnings=warnings,
+            degraded_reasons=reasons,
+            battery_source=self._battery_source_label,
         )
 
     def _activate_failsafe(self, health: SystemHealth):
+        self._healthy_streak = 0
         if not self._failsafe_active:
-            logger.warning("[L5] FAILSAFE ACTIVATED — health=%.2f warnings=%s",
-                           health.overall_health, health.warnings)
+            logger.warning("[L5] FAILSAFE ACTIVATED — health=%.2f reasons=%s",
+                           health.overall_health, health.degraded_reasons)
             self._failsafe_active = True
+            self._record_failsafe_event(health, "failsafe_activated")
+
+    def _clear_failsafe(self, health: SystemHealth):
+        """Autopoietic recovery: leave failsafe after a run of healthy cycles."""
+        self._healthy_streak += 1
+        if self._failsafe_active and self._healthy_streak >= self.RECOVERY_CYCLES:
+            logger.info("[L5] Failsafe cleared after %d healthy cycles",
+                        self._healthy_streak)
+            self._failsafe_active = False
+            self._record_failsafe_event(health, "failsafe_cleared")
+
+    def _record_failsafe_event(self, health: SystemHealth, event_type: str):
+        event = MemoryEvent(
+            event_id=str(uuid.uuid4()),
+            timestamp=health.timestamp,
+            session_id=self.episodic_memory.session_id,
+            event_type=event_type,
+            content={
+                "reasons": health.degraded_reasons,
+                "warnings": health.warnings,
+                "overall_health": health.overall_health,
+                "battery_pct": health.battery_pct,
+                "battery_source": health.battery_source,
+            },
+            risk_level="CRITICAL" if event_type == "failsafe_activated" else "SAFE",
+        )
+        self.working_memory.add(event)
+        self._safe_episodic_add(event)
 
     def _flush_to_autobiographical(self):
         """Move significant episodic events to autobiographical long-term memory."""
@@ -509,6 +715,9 @@ class L5AutopoieticContinuity:
         }
 
     def close(self):
+        # Build the summary BEFORE closing the store: this used to query a
+        # closed sqlite connection, so every close() raised ProgrammingError.
+        summary = self.session_summary()
         self.episodic_memory.close()
         self.autobiographical.close()
-        logger.info("[L5] Session closed. Summary: %s", self.session_summary())
+        logger.info("[L5] Session closed. Summary: %s", summary)

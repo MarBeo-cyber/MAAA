@@ -13,6 +13,11 @@ Endpoints:
   POST /scenario/<name>     → inject a simulated scenario
   POST /tick/n/<n>          → run n ticks manually
   GET  /session             → session summary from L5
+  GET  /override            → current human override
+  POST /override            → set/clear the human override (NFR-05)
+
+All sensor input behind these endpoints is synthetic — see README.md.
+The full contract is documented in docs/API_SPEC.md.
 """
 
 from __future__ import annotations
@@ -20,9 +25,10 @@ from __future__ import annotations
 import threading
 from flask import Flask, jsonify, request
 
+import maaa_config
 from core.maaa_agent import MAAAAgent
 from layers.l1_perception import SceneCondition
-from layers.l4_regulation import UrgencyLevel
+from layers.l4_regulation import OVERRIDE_COMMANDS
 
 
 def create_maaa_app(agent: MAAAAgent) -> Flask:
@@ -88,10 +94,15 @@ def create_maaa_app(agent: MAAAAgent) -> Flask:
             "predictions":    c.event_predictions,
             "causal_summary": c.causal_summary,
             "health": {
-                "ok":           not s.health.is_degraded,
-                "battery_pct":  round(s.health.battery_pct, 1),
-                "failsafe":     s.health.failsafe_active,
-                "warnings":     s.health.warnings,
+                "ok":             not s.health.is_degraded,
+                # None when no battery source is attached: this build ships no
+                # battery-management driver. See L5.set_battery_source.
+                "battery_pct":    (round(s.health.battery_pct, 1)
+                                   if s.health.battery_pct is not None else None),
+                "battery_source": s.health.battery_source,
+                "failsafe":       s.health.failsafe_active,
+                "warnings":       s.health.warnings,
+                "degraded_reasons": s.health.degraded_reasons,
             },
             "l4_stats":   agent.l4.output_stats,
             "output_stats": agent.output.stats,
@@ -100,9 +111,12 @@ def create_maaa_app(agent: MAAAAgent) -> Flask:
     @app.get("/status")
     def status():
         return jsonify({
-            "agent": "MAAA v1.0",
+            "agent": f"MAAA v{maaa_config.VERSION}",
             "tick":  agent.tick_count,
             "running": agent._running,
+            "simulation_mode": agent.simulation_mode,
+            "data_source": "synthetic",
+            "override": agent.override,
             "session": agent.l5.session_summary(),
             "last": _snap_dict(),
         })
@@ -240,19 +254,37 @@ def create_maaa_app(agent: MAAAAgent) -> Flask:
     @app.post("/scenario/<name>")
     def inject_scenario(name: str):
         mapping = {
-            "normal":     (SceneCondition.NORMAL,     0.1, 0.0, 0.0, False),
-            "smoky":      (SceneCondition.SMOKY,      0.5, 0.3, 0.2, True),
-            "dark":       (SceneCondition.DARK,       0.4, 0.2, 0.1, False),
-            "collapsed":  (SceneCondition.COLLAPSED,  0.8, 0.7, 0.6, True),
-            "panic":      (SceneCondition.COLLAPSED,  0.9, 0.95, 0.7, True),
-            "dusty":      (SceneCondition.DUSTY,      0.4, 0.2, 0.3, False),
+            "normal":     (SceneCondition.NORMAL,     0.1, 0.0,  0.0, False, 0.0),
+            "smoky":      (SceneCondition.SMOKY,      0.5, 0.3,  0.2, True,  0.0),
+            "dark":       (SceneCondition.DARK,       0.4, 0.2,  0.1, False, 0.0),
+            "collapsed":  (SceneCondition.COLLAPSED,  0.8, 0.7,  0.6, True,  0.0),
+            "panic":      (SceneCondition.COLLAPSED,  0.9, 0.95, 0.7, True,  0.0),
+            "dusty":      (SceneCondition.DUSTY,      0.4, 0.2,  0.3, False, 0.0),
+            "obstructed": (SceneCondition.OBSTRUCTED, 0.4, 0.1,  0.8, False, 0.0),
+            "frozen":     (SceneCondition.SMOKY,      0.9, 0.0,  0.3, True,  1.0),
         }
         if name not in mapping:
             return jsonify({"error": f"unknown scenario '{name}'",
                             "available": list(mapping.keys())}), 400
-        scene, stress, panic, obs, sounds = mapping[name]
-        agent.inject_scenario(scene, stress, panic, obs, sounds)
+        scene, stress, panic, obs, sounds, freeze = mapping[name]
+        agent.inject_scenario(scene, stress, panic, obs, sounds, freeze)
         return jsonify({"scenario": name, "injected": True})
+
+    @app.get("/override")
+    def get_override():
+        return jsonify({"override": agent.override,
+                        "available": list(OVERRIDE_COMMANDS)})
+
+    @app.post("/override")
+    def set_override():
+        payload = request.get_json(silent=True) or {}
+        command = payload.get("command", request.args.get("command"))
+        try:
+            active = agent.set_override(command)
+        except ValueError as exc:
+            return jsonify({"error": str(exc),
+                            "available": list(OVERRIDE_COMMANDS)}), 400
+        return jsonify({"override": active, "applied": command})
 
     @app.post("/tick/n/<int:n>")
     def run_n_ticks(n: int):

@@ -1,6 +1,6 @@
-from maaa_core.models import SensorFrame, AutopoieticStatus
+from maaa_core.models import (SensorFrame, AutopoieticStatus, RiskLevel,
+                              OutputChannel)
 from maaa_core.orchestrator import MAAAOrchestrator
-from maaa_core.regulatory import RegulatoryEngine
 from maaa_core.human_state import HumanStateEstimator
 
 
@@ -47,3 +47,69 @@ def test_low_risk_observe_only():
     frame = SensorFrame(hazards={"corridoio": 0.12}, safe_paths=["uscita"])
     plan = maaa.process(frame, AutopoieticStatus(True, 70, 0.95, 60))
     assert plan.mode.value == "observe"
+
+
+# ── Human override, NFR-05 (SensorFrame.user_command was declared, never read) ──
+
+def test_user_command_mute_latches_until_resume():
+    maaa = MAAAOrchestrator()
+    status = AutopoieticStatus(True, 70, 0.95, 60)
+    hazards = {"corridoio": 0.50}
+
+    muted = maaa.process(SensorFrame(hazards=hazards, safe_paths=["uscita"],
+                                     user_command="mute"), status)
+    assert muted.reason == "user_override_mute"
+    assert muted.channels == [OutputChannel.LOG]
+
+    # No further command: the mute is still in force.
+    still = maaa.process(SensorFrame(hazards=hazards, safe_paths=["uscita"]), status)
+    assert still.reason == "user_override_mute"
+
+    resumed = maaa.process(SensorFrame(hazards={"corridoio": 0.70},
+                                       safe_paths=["uscita"],
+                                       user_command="resume"), status)
+    assert resumed.reason == "high_risk"
+
+
+def test_user_command_stop_suppresses_only_this_frame():
+    maaa = MAAAOrchestrator()
+    status = AutopoieticStatus(True, 70, 0.95, 60)
+    stopped = maaa.process(SensorFrame(hazards={"corridoio": 0.70},
+                                       safe_paths=["uscita"],
+                                       user_command="stop"), status)
+    assert stopped.reason == "user_override_stop"
+    following = maaa.process(SensorFrame(hazards={"corridoio": 0.70},
+                                         safe_paths=["uscita"]), status)
+    assert following.reason == "high_risk"
+
+
+def test_mute_cannot_silence_critical_guidance():
+    """docs/SAFETY.md: the user can switch off advice, not the danger warning."""
+    maaa = MAAAOrchestrator()
+    status = AutopoieticStatus(True, 70, 0.95, 60)
+    maaa.process(SensorFrame(hazards={"corridoio": 0.10}, user_command="mute"), status)
+    plan = maaa.process(SensorFrame(hazards={"scala": 0.94},
+                                    safe_paths=["porta_est"]), status)
+    assert plan.priority is RiskLevel.CRITICAL
+    assert plan.reason == "critical_risk"
+
+
+def test_unknown_user_command_is_ignored_and_logged(caplog):
+    maaa = MAAAOrchestrator()
+    status = AutopoieticStatus(True, 70, 0.95, 60)
+    with caplog.at_level("WARNING", logger="maaa.core.orchestrator"):
+        plan = maaa.process(SensorFrame(hazards={"corridoio": 0.70},
+                                        safe_paths=["uscita"],
+                                        user_command="launch"), status)
+    assert plan.reason == "high_risk"
+    assert any("unknown user_command" in r.getMessage() for r in caplog.records)
+
+
+def test_risk_engine_is_a_classifier_over_supplied_hazards():
+    """Documented behaviour: the score is the caller's largest hazard value,
+    put in a band. Nothing is estimated."""
+    from maaa_core.perception import SceneGraphBuilder
+    from maaa_core.risk import RiskEstimationEngine
+    graph = SceneGraphBuilder().build(SensorFrame(hazards={"a": 0.42, "b": 0.77}))
+    score, level, item = RiskEstimationEngine().score(graph)
+    assert (score, level.value, item) == (0.77, "HIGH", "b")

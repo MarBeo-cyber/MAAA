@@ -6,8 +6,13 @@ from typing import Dict, List, Optional
 from uuid import uuid4
 from datetime import datetime
 
+import maaa_config
+
 
 class RiskLevel(str, Enum):
+    # Same member set and same band boundaries as layers.l2_cognition.RiskLevel
+    # (both are built from maaa_config.risk_bands()).
+    SAFE = "SAFE"
     LOW = "LOW"
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
@@ -46,6 +51,8 @@ class SensorFrame:
     imu_instability: float = 0.0
     audio_stress: float = 0.0
     gaze_fixation_risk: float = 0.0
+    #: Human override (NFR-05). Read by MAAAOrchestrator.process; see
+    #: maaa_core.regulatory.USER_COMMANDS for the accepted values.
     user_command: Optional[str] = None
 
 
@@ -94,7 +101,7 @@ class GuidancePlan:
     target_path: Optional[str] = None
     avoid: Optional[str] = None
     priority: RiskLevel = RiskLevel.LOW
-    max_words: int = 9
+    max_words: int = field(default_factory=maaa_config.max_words)
     reason: str = ""
 
 
@@ -106,10 +113,13 @@ class AutopoieticStatus:
     latency_ms: float
     fallback_active: bool = False
 
-    def should_failsafe(self, max_latency_ms: float = 200.0) -> bool:
+    def should_failsafe(self, max_latency_ms: Optional[float] = None) -> bool:
+        """Failsafe thresholds come from config/default.yaml (maaa.failsafe)."""
+        if max_latency_ms is None:
+            max_latency_ms = maaa_config.failsafe_setting("max_latency_ms", 200.0)
         return (
             not self.system_ok
-            or self.battery_pct < 5
-            or self.sensor_integrity < 0.45
+            or self.battery_pct < maaa_config.failsafe_setting("battery_min_pct", 5.0)
+            or self.sensor_integrity < maaa_config.failsafe_setting("sensor_integrity_min", 0.45)
             or self.latency_ms > max_latency_ms
         )

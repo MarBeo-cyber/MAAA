@@ -17,12 +17,12 @@ Target: latenza end-to-end < 200ms, tier critico < 50ms
 
 from __future__ import annotations
 
-import sys
 import time
 import logging
-import threading
 from dataclasses import dataclass
+from typing import Optional
 
+import maaa_config
 from layers.l1_perception  import L1EmbodiedPerception,  SceneCondition, PerceptionFrame
 from layers.l2_cognition   import L2SituationalCognition, CognitionFrame
 from layers.l3_human_state import L3HumanStateMonitor,   HumanStateFrame
@@ -115,7 +115,7 @@ class MAAAAgent:
 
         logger.info("╔══════════════════════════════════════════════╗")
         logger.info("║  MAAA — Metacognitive Autopoietic Adaptive   ║")
-        logger.info("║         Agent  v1.0  — Initializing          ║")
+        logger.info("║         Agent  v%-8s — Initializing      ║", maaa_config.VERSION)
         logger.info("╚══════════════════════════════════════════════╝")
 
         self.simulation_mode = simulation_mode
@@ -140,22 +140,40 @@ class MAAAAgent:
 
     # ── Single pipeline cycle ─────────────────────────────────────────────────
 
+    def _run_stage(self, component: str, fn, *args):
+        """Run one pipeline stage, timing it and heartbeating the result to L5.
+
+        A stage that raises reports ok=False, which is what makes
+        SystemHealth.is_degraded — and therefore the failsafe — reachable.
+        """
+        started = time.time()
+        try:
+            result = fn(*args)
+        except Exception as exc:                      # noqa: BLE001 — must not kill the loop
+            self.l5.report_heartbeat(component, ok=False,
+                                     latency_ms=(time.time() - started) * 1000,
+                                     detail=f"{type(exc).__name__}: {exc}")
+            raise
+        self.l5.report_heartbeat(component, ok=True,
+                                 latency_ms=(time.time() - started) * 1000)
+        return result
+
     def tick(self) -> PipelineSnapshot:
         """Execute one complete 8-step pipeline cycle."""
         cycle_start = time.time()
         self._tick += 1
 
         # Step 1-2: Sensor acquisition + pre-processing (L1)
-        perception = self.l1.capture()
+        perception = self._run_stage("sensor", self.l1.capture)
 
         # Step 3-4: Semantic perception + scene graph (L2)
-        cognition = self.l2.process(perception)
+        cognition = self._run_stage("l2", self.l2.process, perception)
 
         # Step 5: Human state estimation (L3)
-        human = self.l3.process(perception)
+        human = self._run_stage("l3", self.l3.process, perception)
 
         # Step 6: Regulatory engine (L4) — applies 4 filters
-        guidance = self.l4.regulate(cognition, human)
+        guidance = self._run_stage("l4", self.l4.regulate, cognition, human)
 
         # Step 7: Output dispatch
         self.output.dispatch(guidance, human)
@@ -185,9 +203,20 @@ class MAAAAgent:
 
     def inject_scenario(self, scene: SceneCondition, stress: float = 0.0,
                         panic: float = 0.0, obstruction: float = 0.0,
-                        emergency_sounds: bool = False):
+                        emergency_sounds: bool = False, freeze: float = 0.0):
         """Inject a simulated emergency scenario."""
-        self.l1.inject_scenario(scene, stress, panic, obstruction, emergency_sounds)
+        self.l1.inject_scenario(scene, stress, panic, obstruction,
+                                emergency_sounds, freeze)
+
+    # ── Human override (NFR-05) ───────────────────────────────────────────────
+
+    def set_override(self, command: Optional[str]) -> Optional[str]:
+        """Apply a human override. See L4SymbioticRegulation.set_override."""
+        return self.l4.set_override(command)
+
+    @property
+    def override(self) -> Optional[str]:
+        return self.l4.override
 
     # ── Continuous run loop ───────────────────────────────────────────────────
 

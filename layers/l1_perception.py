@@ -11,6 +11,12 @@ Astrazione dei sensori fisici indossabili:
 
 In produzione ogni SensorAdapter si collega al driver hardware reale.
 In modalità simulazione genera dati sintetici per testing e demo.
+
+NOTA — nessun driver hardware è incluso in questo repository. Tutti gli adapter
+funzionano SOLO in ``simulation_mode=True`` e producono dati sintetici. Con
+``simulation_mode=False`` ogni adapter solleva ``HardwareUnavailableError``:
+non esiste alcun percorso che restituisca dati sintetici spacciandoli per
+letture reali.
 """
 
 from __future__ import annotations
@@ -24,6 +30,23 @@ from typing import Optional
 from enum import Enum
 
 logger = logging.getLogger("maaa.l1_perception")
+
+
+class HardwareUnavailableError(RuntimeError):
+    """Raised when a sensor adapter is asked for a real reading.
+
+    No device SDK is bundled with this repository, so there is no reading to
+    give.  Adapters raise this instead of quietly returning synthetic data.
+    """
+
+
+def _require_simulation(adapter: object, sensor: str) -> None:
+    """Guard every adapter read: no hardware driver exists in this repository."""
+    if not getattr(adapter, "simulation_mode", False):
+        raise HardwareUnavailableError(
+            f"{sensor}: no hardware driver is bundled with MAAA. "
+            f"Construct the adapter with simulation_mode=True to use synthetic data."
+        )
 
 
 # ── Data Models ───────────────────────────────────────────────────────────────
@@ -174,30 +197,30 @@ class ARGlassesAdapter:
             self._init_hardware()
 
     def _init_hardware(self):
-        """Connect to real AR glasses SDK."""
-        try:
-            # Production: import device-specific SDK
-            # import meta_ar_sdk as sdk
-            # self._device = sdk.connect()
-            logger.info("[ARGlasses] Hardware connected")
-        except ImportError:
-            logger.warning("[ARGlasses] SDK not found — falling back to simulation")
-            self.simulation_mode = True
+        """Attempt to connect to a real AR glasses SDK.
+
+        There is none in this repository, so this always fails.  It must not
+        log a success it did not achieve, and it must not silently downgrade to
+        simulation — that is what made the synthetic data indistinguishable
+        from real readings.
+        """
+        # Production would be:
+        #   import meta_ar_sdk as sdk
+        #   self._device = sdk.connect()
+        logger.error("[ARGlasses] No device SDK bundled — hardware mode unavailable")
+        raise HardwareUnavailableError(
+            "ARGlassesAdapter: no device SDK bundled with MAAA. "
+            "Use simulation_mode=True for synthetic frames."
+        )
 
     def set_scenario(self, scenario: SceneCondition):
         """For simulation only: inject a scene condition."""
         self._scenario = scenario
 
     def capture_frame(self) -> VideoFrame:
+        _require_simulation(self, "ARGlassesAdapter")
         self._frame_count += 1
         ts = time.time()
-
-        if self.simulation_mode:
-            return self._synthesise_frame(ts)
-
-        # Production path — read from device SDK
-        # raw = self._device.get_frame()
-        # return self._process_raw_frame(raw, ts)
         return self._synthesise_frame(ts)
 
     def _synthesise_frame(self, ts: float) -> VideoFrame:
@@ -230,19 +253,30 @@ class IMUAdapter:
     def __init__(self, simulation_mode: bool = True):
         self.simulation_mode = simulation_mode
         self._panic_mode = False
+        self._freeze_level = 0.0
 
     def set_panic(self, active: bool):
         self._panic_mode = active
 
+    def set_freeze(self, level: float):
+        """Simulation only: tonic immobility — movement drops below the user's baseline."""
+        self._freeze_level = max(0.0, min(1.0, level))
+
     def read(self) -> IMUData:
+        _require_simulation(self, "IMUAdapter")
         ts = time.time()
         if self._panic_mode:
             # Rapid, erratic movement
             ax, ay, az = random.gauss(2.0, 1.5), random.gauss(1.5, 1.0), random.gauss(9.8, 2.0)
             gx, gy, gz = random.gauss(0.8, 0.4), random.gauss(0.6, 0.3), random.gauss(0.5, 0.3)
         else:
-            ax, ay, az = random.gauss(0.1, 0.05), random.gauss(0.1, 0.05), random.gauss(9.8, 0.1)
-            gx, gy, gz = random.gauss(0, 0.02), random.gauss(0, 0.02), random.gauss(0, 0.02)
+            # Freezing damps both the linear micro-movement and the head rotation
+            damp = 1.0 - 0.9 * self._freeze_level
+            ax, ay = random.gauss(0.1, 0.05) * damp, random.gauss(0.1, 0.05) * damp
+            az = random.gauss(9.8, 0.1)
+            gx = random.gauss(0, 0.02) * damp
+            gy = random.gauss(0, 0.02) * damp
+            gz = random.gauss(0, 0.02) * damp
 
         total_a = math.sqrt(ax**2 + ay**2 + az**2)
         return IMUData(
@@ -266,6 +300,7 @@ class DepthCameraAdapter:
         self._obstruction_level = max(0.0, min(1.0, level))
 
     def read(self) -> DepthMap:
+        _require_simulation(self, "DepthCameraAdapter")
         ts = time.time()
         min_d = max(0.3, 0.5 + random.gauss(0, 0.1) - self._obstruction_level * 0.4)
         mean_d = min_d + random.uniform(1.0, 3.0) * (1.0 - self._obstruction_level)
@@ -282,21 +317,28 @@ class EyeTrackerAdapter:
     def __init__(self, simulation_mode: bool = True):
         self.simulation_mode = simulation_mode
         self._stress_level = 0.0
+        self._freeze_level = 0.0
 
     def set_stress(self, level: float):
         self._stress_level = max(0.0, min(1.0, level))
 
+    def set_freeze(self, level: float):
+        """Simulation only: gaze locks — long fixations, near-zero saccades, arousal stays high."""
+        self._freeze_level = max(0.0, min(1.0, level))
+
     def read(self) -> EyeTrackingData:
+        _require_simulation(self, "EyeTrackerAdapter")
         ts = time.time()
         s = self._stress_level
+        f = self._freeze_level
         return EyeTrackingData(
             timestamp=ts,
             gaze_x=random.uniform(0.2, 0.8),
             gaze_y=random.uniform(0.2, 0.8),
             blink_rate_per_min=max(2, random.gauss(15 - s * 8, 2)),   # stress reduces blinking
             pupil_diameter_mm=max(2.0, random.gauss(4.0 + s * 3.0, 0.5)),  # stress dilates
-            fixation_duration_ms=max(50, random.gauss(300 - s * 200, 30)),
-            saccade_velocity=max(0, random.gauss(100 + s * 300, 20)),
+            fixation_duration_ms=max(50, random.gauss(300 - s * 200 + f * 900, 30)),
+            saccade_velocity=max(0, random.gauss((100 + s * 300) * (1.0 - 0.9 * f), 20)),
             vergence_angle=random.gauss(2.5, 0.3),
         )
 
@@ -306,6 +348,7 @@ class MicrophoneAdapter:
         self.simulation_mode = simulation_mode
         self._panic_level = 0.0
         self._emergency_sounds = False
+        self._freeze_level = 0.0
 
     def set_panic(self, level: float):
         self._panic_level = max(0.0, min(1.0, level))
@@ -313,15 +356,21 @@ class MicrophoneAdapter:
     def set_emergency_sounds(self, active: bool):
         self._emergency_sounds = active
 
+    def set_freeze(self, level: float):
+        """Simulation only: speech rate collapses (docstring range: freeze < 60 wpm)."""
+        self._freeze_level = max(0.0, min(1.0, level))
+
     def read(self) -> AudioFrame:
+        _require_simulation(self, "MicrophoneAdapter")
         ts = time.time()
         p = self._panic_level
+        f = self._freeze_level
         return AudioFrame(
             timestamp=ts,
             user_voice_detected=random.random() > 0.3,
             voice_pitch_hz=max(80, random.gauss(150 + p * 100, 20)),   # panic raises pitch
             voice_tremor=max(0, random.gauss(p * 0.7, 0.1)),
-            speech_rate_wpm=max(40, random.gauss(130 + p * 80, 15)),
+            speech_rate_wpm=max(30, random.gauss(130 + p * 80 - f * 85, 15)),
             ambient_db=random.gauss(45 + p * 30, 5),
             impact_sounds=self._emergency_sounds and random.random() < 0.3,
             smoke_alarm=self._emergency_sounds and random.random() < 0.2,
@@ -338,6 +387,7 @@ class GPSAdapter:
         self.base_lon = base_lon
 
     def read(self) -> GPSData:
+        _require_simulation(self, "GPSAdapter")
         return GPSData(
             timestamp=time.time(),
             latitude=self.base_lat + random.gauss(0, 0.00001),
@@ -359,6 +409,9 @@ class L1EmbodiedPerception:
     """
 
     def __init__(self, simulation_mode: bool = True):
+        if not simulation_mode:
+            # Fail loudly at construction: there is no driver to fall back on.
+            logger.error("[L1] simulation_mode=False requested but no sensor drivers exist")
         self.simulation_mode = simulation_mode
         self.ar_glasses  = ARGlassesAdapter(simulation_mode)
         self.imu         = IMUAdapter(simulation_mode)
@@ -371,7 +424,12 @@ class L1EmbodiedPerception:
         logger.info("[L1] Embodied Perception initialized (sim=%s)", simulation_mode)
 
     def capture(self) -> PerceptionFrame:
-        """Capture one synchronized frame from all sensors."""
+        """Capture one synchronized frame from all sensors.
+
+        Raises HardwareUnavailableError if simulation_mode is False — the data
+        would otherwise be synthetic while claiming to be a sensor reading.
+        """
+        _require_simulation(self, "L1EmbodiedPerception")
         ts = time.time()
         self._sample_count += 1
 
@@ -391,15 +449,24 @@ class L1EmbodiedPerception:
 
     def inject_scenario(self, scene: SceneCondition, stress: float = 0.0,
                         panic: float = 0.0, obstruction: float = 0.0,
-                        emergency_sounds: bool = False):
-        """Inject a simulated emergency scenario for testing."""
+                        emergency_sounds: bool = False, freeze: float = 0.0):
+        """Inject a simulated emergency scenario for testing.
+
+        ``freeze`` drives tonic immobility (movement, saccades and speech rate
+        all collapse while arousal stays high) — the input pattern L3's
+        freeze detector looks for.
+        """
         self.ar_glasses.set_scenario(scene)
         self.eye_tracker.set_stress(stress)
+        self.eye_tracker.set_freeze(freeze)
         self.imu.set_panic(panic > 0.5)
+        self.imu.set_freeze(freeze)
         self.depth_cam.set_obstruction(obstruction)
         self.microphone.set_panic(panic)
+        self.microphone.set_freeze(freeze)
         self.microphone.set_emergency_sounds(emergency_sounds)
-        logger.info("[L1] Scenario injected: %s stress=%.2f panic=%.2f", scene.value, stress, panic)
+        logger.info("[L1] Scenario injected: %s stress=%.2f panic=%.2f freeze=%.2f",
+                    scene.value, stress, panic, freeze)
 
     @property
     def sample_count(self) -> int:
