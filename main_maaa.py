@@ -26,6 +26,17 @@ import threading
 # Allow `python main_maaa.py` from a clean clone without installing the package.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# La console di Windows usa cp1252: i simboli Unicode di questo CLI (box
+# drawing, pallini di stato) la fanno morire con UnicodeEncodeError a meta'
+# esecuzione, dopo che il sistema ha gia' fatto lavoro. Forziamo UTF-8 sullo
+# stdout dove il runtime lo permette, con sostituzione al posto dell'errore.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
