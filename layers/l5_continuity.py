@@ -18,12 +18,21 @@ Memoria a 3 livelli (Sez. 6 del documento):
 
 from __future__ import annotations
 
+import os
+import tempfile
 import time
 import json
 import uuid
 import shutil
 import hashlib
 import sqlite3
+
+# I percorsi di default vivono nella directory temporanea DEL SISTEMA.
+# Scrivere "/tmp/..." a mano funziona su Linux e su Windows finisce in
+# C:\tmp\, che spesso non esiste: il file non si apre e l'errore arriva
+# lontano dalla causa. tempfile.gettempdir() risolve la cosa ovunque.
+DEFAULT_DB_PATH      = os.path.join(tempfile.gettempdir(), "maaa_episodes.db")
+DEFAULT_AUTOBIO_PATH = os.path.join(tempfile.gettempdir(), "maaa_autobio.json")
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -119,7 +128,7 @@ class EpisodicMemory:
     Enables: mission debriefing, pattern detection, coherence across interruptions.
     """
 
-    def __init__(self, db_path: str = "/tmp/maaa_episodes.db"):
+    def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = db_path
         self.session_id = str(uuid.uuid4())[:8]
         self.last_error: Optional[str] = None
@@ -229,7 +238,7 @@ class AutobiographicalMemory:
 
     DIM = 16   # Compact feature vector for simulation (production: 1536-dim)
 
-    def __init__(self, storage_path: str = "/tmp/maaa_autobio.json"):
+    def __init__(self, storage_path: str = DEFAULT_AUTOBIO_PATH):
         self.storage_path = storage_path
         self._memories: list[dict] = []
         self._vectors: list[list[float]] = []
@@ -394,8 +403,8 @@ class L5AutopoieticContinuity:
     #: Stages that must report a heartbeat every cycle for the system to be healthy.
     COMPONENTS = ("sensor", "l2", "l3", "l4")
 
-    def __init__(self, db_path: str = "/tmp/maaa_episodes.db",
-                 autobio_path: str = "/tmp/maaa_autobio.json"):
+    def __init__(self, db_path: str = DEFAULT_DB_PATH,
+                 autobio_path: str = DEFAULT_AUTOBIO_PATH):
         self.working_memory      = WorkingMemory()
         self.episodic_memory     = EpisodicMemory(db_path)
         self.autobiographical    = AutobiographicalMemory(autobio_path)

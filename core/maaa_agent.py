@@ -27,7 +27,8 @@ from layers.l1_perception  import L1EmbodiedPerception,  SceneCondition, Percept
 from layers.l2_cognition   import L2SituationalCognition, CognitionFrame
 from layers.l3_human_state import L3HumanStateMonitor,   HumanStateFrame
 from layers.l4_regulation  import L4SymbioticRegulation,  GuidanceOutput, UrgencyLevel
-from layers.l5_continuity  import L5AutopoieticContinuity, SystemHealth
+from layers.l5_continuity  import (L5AutopoieticContinuity, SystemHealth,
+                                   DEFAULT_DB_PATH, DEFAULT_AUTOBIO_PATH)
 
 logger = logging.getLogger("maaa.agent")
 
@@ -110,8 +111,8 @@ class MAAAAgent:
     """
 
     def __init__(self, simulation_mode: bool = True, verbose: bool = True,
-                 db_path: str = "/tmp/maaa_episodes.db",
-                 autobio_path: str = "/tmp/maaa_autobio.json"):
+                 db_path: str = DEFAULT_DB_PATH,
+                 autobio_path: str = DEFAULT_AUTOBIO_PATH):
 
         logger.info("╔══════════════════════════════════════════════╗")
         logger.info("║  MAAA — Metacognitive Autopoietic Adaptive   ║")
